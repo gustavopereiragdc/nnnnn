@@ -1,0 +1,6 @@
+# ffmpeg precisa estar instalado no sistema (não é pacote pip).
+yt-dlp
+numpy
+opencv-python>=4.10,<5
+faster-whisper
+av>=13,<19

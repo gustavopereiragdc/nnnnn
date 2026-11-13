@@ -1,0 +1,35 @@
+# Ambientes virtuais (centenas de MB)
+venv/
+.venv/
+
+# Cache do Python
+__pycache__/
+*.pyc
+
+# Saídas geradas pelo clipes.py
+clips/
+saida/
+*.ass
+*_9x16.mp4
+*_9x16_legenda.mp4
+*_legenda.mp4
+
+# Vídeos e áudios baixados
+*.mp4
+*.mkv
+*.webm
+*.m4a
+*.mp3
+*.wav
+
+# Modelos baixados (o Whisper vai para ~/.cache/huggingface, não para cá)
+*.bin
+*.pt
+*.safetensors
+*.gguf
+modelos/*
+!modelos/face_detection_yunet_2023mar.onnx
+
+# Sistema
+.DS_Store
+Thumbs.db
