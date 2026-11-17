@@ -4,8 +4,10 @@ Um comando, dois modos:
 
     python3 clipes.py youtube <URL> [--clips] [--shorts] ...
         Lê o heatmap do YouTube ("momentos mais revisados"). Se o vídeo não
-        tiver heatmap, usa os horários mais citados nos comentários. Encaixa
-        o corte nas pausas da fala e, se pedido, baixa os clipes e gera o 9:16.
+        tiver heatmap, usa os horários mais citados nos comentários. Sem
+        horário nenhum, transcreve a fala e escolhe trechos com gancho,
+        pico de volume e frase que se entende sozinha. Encaixa o corte nas
+        pausas da fala e, se pedido, baixa os clipes e gera o 9:16.
 
     python3 clipes.py short <entrada.mp4> [saida.mp4]
         Recorta um vídeo já baixado em Short 9:16 (movimento, depois rosto).
@@ -57,6 +59,8 @@ SILENCIO_MIN_S = 0.35
 VOZ_HZ = (200, 3000)
 MAX_COMENTARIOS = 300       # comentários do topo lidos quando não há heatmap
 JANELA_COMENTARIO_S = 20    # timestamps dentro dessa distância contam como o mesmo momento
+PAUSA_FRASE_S = 0.45        # silêncio que separa uma frase da outra
+GANCHO_S = 2.0              # o gancho precisa caber no começo do clipe
 # pares que aparecem em comentário como proporção de tela, não como horário
 _ASPECTOS = {(16, 9), (9, 16), (21, 9), (4, 3)}
 _TS_RE = re.compile(r"(?<!\d)(?:(\d{1,2}):)?(\d{1,3}):([0-5]\d)(?!\d)")
@@ -145,9 +149,9 @@ def fmt_ts(segundos: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def top_trechos(info: dict, n: int) -> list:
+def top_trechos(info: dict) -> list:
     heatmap = info.get("heatmap") or []
-    return sorted(heatmap, key=lambda h: h["value"], reverse=True)[:n]
+    return sorted(heatmap, key=lambda h: h["value"], reverse=True)
 
 
 def _segundos_do_texto(texto: str, duracao: float) -> set:
@@ -192,25 +196,21 @@ def _agrupar_tempos(tempos: list, janela: float) -> list:
     return grupos
 
 
-def trechos_de_timestamps(tempos: list, n: int, dur_alvo: float) -> list:
-    """Os n grupos mais citados, no mesmo formato do heatmap."""
+def trechos_de_timestamps(tempos: list, n: int, dur_alvo: float,
+                          duracao: float = 0) -> list:
+    """Os n grupos mais citados, sem duas janelas na mesma minutagem."""
     grupos = _agrupar_tempos(tempos, JANELA_COMENTARIO_S)
     grupos.sort(key=lambda g: (-len(g), _mediana(g)))
-    separacao = max(15.0, dur_alvo * 0.5)
-    escolhidos = []
+    brutos = []
     for g in grupos:
         meio = _mediana(g)
-        if any(abs(meio - e["start_time"]) < separacao for e in escolhidos):
-            continue
-        escolhidos.append({
+        brutos.append({
             "start_time": meio,
             "end_time": meio,
             "value": float(len(g)),
             "origem": "comentarios",
         })
-        if len(escolhidos) >= n:
-            break
-    return escolhidos
+    return escolher_sem_sobreposicao(brutos, n, dur_alvo, duracao)
 
 
 def baixar_comentarios(url: str, limite: int = MAX_COMENTARIOS) -> list:
@@ -244,7 +244,190 @@ def trechos_dos_comentarios(url: str, n: int, dur_alvo: float,
             continue
         for t in _segundos_do_texto(c.get("text") or "", duracao):
             tempos.append(t)
-    return trechos_de_timestamps(tempos, n, dur_alvo), len(comentarios), len(tempos)
+    return (trechos_de_timestamps(tempos, n, dur_alvo, duracao),
+            len(comentarios), len(tempos))
+
+
+# Começo que pede contexto: o Short fica sem o que veio antes.
+_PREENCHIMENTO = {
+    "ele", "ela", "eles", "elas", "isso", "esse", "essa", "esses", "essas",
+    "aquele", "aquela", "aquilo", "aí", "ai", "então", "entao", "tipo",
+    "cara", "mano", "né", "ne", "assim", "bom", "bem", "mas", "daí", "dai",
+    "eh", "ah", "uhm", "hum", "olha",
+}
+# Começo que segura quem está vendo: pergunta, negação, número, superlativo.
+_PERGUNTA = {
+    "como", "qual", "quais", "quem", "quando", "onde", "quanto", "quantos",
+    "quantas", "cadê", "cade", "será", "sera",
+    "why", "how", "what", "when", "where", "who",
+}
+_GANCHO_FORTE = {
+    "nunca", "jamais", "ninguém", "ninguem", "nada", "nenhum", "nenhuma",
+    "segredo", "problema", "verdade", "cuidado", "pare", "parar",
+    "pior", "melhor", "maior", "único", "unico", "única", "unica",
+    "importante", "atenção", "atencao", "mentira", "erro", "errado",
+    "imagina", "sabia", "espera", "calma",
+}
+_NUMEROS = {
+    "zero", "um", "uma", "dois", "duas", "três", "tres", "quatro", "cinco",
+    "seis", "sete", "oito", "nove", "dez", "primeiro", "primeira",
+}
+
+
+def _token(texto: str) -> str:
+    return re.sub(r"^[^\w]+|[^\w]+$", "", (texto or "").lower())
+
+
+def _inicios_de_frase(palavras: list) -> list:
+    """Índices em que uma frase começa: a primeira palavra, depois de pausa ou de ponto."""
+    inicios = []
+    anterior_fim = None
+    anterior_fecha = True
+    for i, (ini, fim, texto) in enumerate(palavras):
+        gap = anterior_fim is not None and ini - anterior_fim > PAUSA_FRASE_S
+        if i == 0 or gap or anterior_fecha:
+            inicios.append(i)
+        anterior_fim = fim
+        anterior_fecha = _fecha_frase(texto)
+    return inicios
+
+
+def _frase_inicial(palavras: list, i: int) -> list:
+    frase = [palavras[i]]
+    for palavra in palavras[i + 1:]:
+        if palavra[0] - frase[-1][1] > PAUSA_FRASE_S:
+            break
+        frase.append(palavra)
+        if _fecha_frase(palavra[2]) or len(frase) >= 24:
+            break
+    return frase
+
+
+def _nota_gancho(palavras: list) -> float:
+    """1 se os 2 primeiros segundos abrem com pergunta, negação, número ou superlativo."""
+    tokens = []
+    for _, _, texto in palavras:
+        tok = _token(texto)
+        if tok:
+            tokens.append((tok, texto))
+    if not tokens:
+        return 0.0
+    palavras_tok = [t for t, _ in tokens]
+    nota = 0.0
+    tem_pergunta = any("?" in bruto for _, bruto in tokens)
+    primeiro = palavras_tok[0]
+    if primeiro == "por":
+        segundo = palavras_tok[1] if len(palavras_tok) > 1 else ""
+        if tem_pergunta or segundo in {"que", "quê"}:
+            nota = 1.0
+    elif tem_pergunta or primeiro in _PERGUNTA:
+        nota = 1.0
+    if any(t in _GANCHO_FORTE for t in palavras_tok[:3]):
+        nota = max(nota, 0.85)
+    if any(t in _NUMEROS or re.search(r"\d", t) for t in palavras_tok[:3]):
+        nota = max(nota, 0.8)
+    if primeiro in _PREENCHIMENTO:
+        return nota * 0.35
+    return nota
+
+
+def _nota_sozinha(frase: list) -> float:
+    """Frase curta, fechada e sem pronome no começo se entende fora do vídeo."""
+    n = len(frase)
+    if n < 4:
+        return 0.15
+    if n > 22:
+        nota = 0.25
+    elif 6 <= n <= 16:
+        nota = 1.0
+    else:
+        nota = 0.6
+    if not _fecha_frase(frase[-1][2]):
+        nota *= 0.7
+    if _token(frase[0][2]) in _PREENCHIMENTO:
+        nota *= 0.35
+    return nota
+
+
+def _base_volume(rms: list) -> float:
+    if not rms:
+        return 1e-6
+    s = sorted(rms)
+    return s[min(len(s) - 1, int(len(s) * 0.7))] or 1e-6
+
+
+def _nota_pico(rms: list, passo: float, t0: float, t1: float, base: float) -> float:
+    """Subida de volume depois do gancho: risada, reação, punchline."""
+    if not rms or passo <= 0:
+        return 0.0
+    i0 = max(0, int((t0 + GANCHO_S) / passo))
+    i1 = min(len(rms), int(t1 / passo) + 1)
+    trecho = rms[i0:i1]
+    if not trecho:
+        return 0.0
+    pico = max(trecho)
+    return max(0.0, min(1.0, (pico / base - 1.0) / 2.0))
+
+
+def _envelope_rms(audio_path: str, passo: float = 0.5) -> tuple:
+    """Volume RMS a cada `passo` segundos. Lista vazia se o ffmpeg não devolver áudio."""
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error",
+         "-i", audio_path, "-ac", "1", "-ar", "8000",
+         "-f", "s16le", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        return [], passo
+    import numpy as np
+    amostras = np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32)
+    n = max(1, int(8000 * passo))
+    rms = []
+    for i in range(0, len(amostras) - n + 1, n):
+        bloco = amostras[i:i + n]
+        rms.append(float(np.sqrt(np.mean(bloco * bloco)) / 32768.0))
+    return rms, passo
+
+
+def trechos_da_fala(palavras: list, rms: list, passo: float, n: int,
+                    dur_alvo: float, duracao: float) -> list:
+    """Janelas de `dur_alvo` com gancho, pico de volume e frase que se entende sozinha.
+
+    O clipe começa na frase, no mesmo formato do heatmap.
+    """
+    if not palavras:
+        return []
+    base = _base_volume(rms)
+    candidatos = []
+    for i in _inicios_de_frase(palavras):
+        t0 = palavras[i][0]
+        if duracao and t0 > duracao - min(8.0, dur_alvo * 0.4):
+            continue
+        t1 = t0 + dur_alvo
+        if duracao:
+            t1 = min(float(duracao), t1)
+        if t1 - t0 < dur_alvo * 0.6:
+            continue
+        dentro = [p for p in palavras if t0 - 0.05 <= p[0] < t1]
+        if len(dentro) < 8:
+            continue
+        gancho_palavras = [p for p in dentro if p[0] < t0 + GANCHO_S]
+        frase = _frase_inicial(palavras, i)
+        nota = (0.40 * _nota_gancho(gancho_palavras)
+                + 0.35 * _nota_pico(rms, passo, t0, t1, base)
+                + 0.25 * _nota_sozinha(frase))
+        texto = " ".join(p[2] for p in frase[:8]).strip()
+        candidatos.append((nota, t0, t1, texto))
+
+    candidatos.sort(key=lambda c: (-c[0], c[1]))
+    brutos = [{
+        "start_time": t0,
+        "end_time": t1,
+        "value": nota,
+        "origem": "fala",
+        "frase": texto,
+    } for nota, t0, t1, texto in candidatos]
+    return escolher_sem_sobreposicao(brutos, n, dur_alvo, duracao)
 
 
 def janela(trecho: dict, dur_alvo: float, duracao_video: float) -> tuple:
@@ -256,6 +439,26 @@ def janela(trecho: dict, dur_alvo: float, duracao_video: float) -> tuple:
         fim = duracao_video
         ini = max(0.0, fim - dur_alvo)
     return ini, fim
+
+
+def _sobrepoe(a: tuple, b: tuple) -> bool:
+    return a[0] < b[1] and b[0] < a[1]
+
+
+def escolher_sem_sobreposicao(trechos: list, n: int, dur_alvo: float,
+                              duracao: float) -> list:
+    """Em ordem de prioridade, pula o trecho cuja janela cai numa minutagem já escolhida."""
+    escolhidos = []
+    janelas = []
+    for trecho in trechos:
+        w = janela(trecho, dur_alvo, duracao)
+        if any(_sobrepoe(w, outra) for outra in janelas):
+            continue
+        escolhidos.append(trecho)
+        janelas.append(w)
+        if len(escolhidos) >= n:
+            break
+    return escolhidos
 
 
 def _baixar_com_formato(url: str, opts: dict, formatos: tuple):
@@ -760,7 +963,7 @@ class Transcritor:
         return saida
 
 
-def _legendar_pasta(info: dict, args) -> int:
+def _legendar_pasta(info: dict, args, transcritor=None) -> int:
     vid = info.get("id", "")
     base = sorted(
         f for f in glob.glob(os.path.join(args.out, f"{vid}_*.mp4"))
@@ -776,7 +979,7 @@ def _legendar_pasta(info: dict, args) -> int:
     print(f"\nLegendando {len(alvos)} clipe(s) "
           f"(modelo {args.modelo}, idioma {args.idioma})...")
     idioma = None if args.idioma == "auto" else args.idioma
-    tr = Transcritor(args.modelo, idioma)
+    tr = transcritor or Transcritor(args.modelo, idioma)
     erros = 0
     for f in alvos:
         try:
@@ -831,7 +1034,8 @@ def cmd_youtube(args) -> int:
         print("  python3 clipes.py youtube VIDEO_ID --clips --shorts --legenda")
         return 1
 
-    trechos = top_trechos(info, args.top)
+    trechos = escolher_sem_sobreposicao(
+        top_trechos(info), args.top, args.dur, dur_video)
     if not trechos:
         print("Sem heatmap neste vídeo.")
         print(f"Lendo até {MAX_COMENTARIOS} comentários do topo "
@@ -841,27 +1045,57 @@ def cmd_youtube(args) -> int:
                 args.url, args.top, args.dur, dur_video)
         except Exception as e:
             print(f"  (comentários indisponíveis: {str(e)[:120]})")
-            return 0
+            trechos = []
+        else:
+            if trechos:
+                print(f"  {n_com} comentários, {n_ts} timestamps. "
+                      "Usando os horários mais citados.\n")
+            else:
+                print("Sem timestamps utilizáveis nos comentários.")
+
+    audio_tmp = None
+    audio = None
+    transcritor = None
+    try:
         if not trechos:
-            print("Sem timestamps utilizáveis nos comentários.")
-            return 0
-        print(f"  {n_com} comentários, {n_ts} timestamps. "
-              "Usando os horários mais citados.\n")
+            print(f"Transcrevendo o áudio para montar os clipes "
+                  f"(modelo {args.modelo})...")
+            try:
+                audio_tmp = tempfile.TemporaryDirectory()
+                audio = baixar_audio(args.url, audio_tmp.name)
+                idioma = None if args.idioma == "auto" else args.idioma
+                transcritor = Transcritor(args.modelo, idioma)
+                palavras = transcritor.palavras(audio)
+                rms, passo = _envelope_rms(audio)
+                trechos = trechos_da_fala(
+                    palavras, rms, passo, args.top, args.dur, dur_video)
+            except Exception as e:
+                print(f"  (transcrição falhou: {str(e)[:160]})")
+                return 0
+            if not trechos:
+                print("Sem fala para montar os clipes.")
+                return 0
+            print(f"  {len(palavras)} palavras. Usando gancho, "
+                  "pico de volume e frase que se entende sozinha.\n")
 
-    alvos = [janela(h, args.dur, dur_video) for h in trechos]
+        alvos = [janela(h, args.dur, dur_video) for h in trechos]
 
-    usar_snap = not args.no_snap
-    pausas = []
-    if usar_snap:
-        print("Analisando áudio para achar as pausas da fala...")
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                audio = baixar_audio(args.url, tmp)
+        usar_snap = not args.no_snap
+        pausas = []
+        if usar_snap:
+            print("Analisando áudio para achar as pausas da fala...")
+            try:
+                if audio is None:
+                    audio_tmp = tempfile.TemporaryDirectory()
+                    audio = baixar_audio(args.url, audio_tmp.name)
                 pausas = detectar_pausas(audio, args.sil_db, args.sil_min)
-            print(f"  {len(pausas)} pausas detectadas.\n")
-        except Exception as e:
-            print(f"  (análise de áudio falhou, usando corte exato: {str(e)[:100]})\n")
-            usar_snap = False
+                print(f"  {len(pausas)} pausas detectadas.\n")
+            except Exception as e:
+                print(f"  (análise de áudio falhou, usando corte exato: {str(e)[:100]})\n")
+                usar_snap = False
+    finally:
+        if audio_tmp is not None:
+            audio_tmp.cleanup()
 
     print(f"Top {len(trechos)} trechos:")
     ranges = []
@@ -875,6 +1109,9 @@ def cmd_youtube(args) -> int:
         nota = f"  (+{extra:.0f}s p/ pausa)" if extra > 0.5 else ""
         if h.get("origem") == "comentarios":
             cabeca = f"{i}. {fmt_ts(h['start_time'])} ({int(h['value'])} menções)"
+        elif h.get("origem") == "fala":
+            cabeca = (f"{i}. gancho {fmt_ts(h['start_time'])} "
+                      f"(nota {h['value']:.2f}) \"{h.get('frase', '')}\"")
         else:
             cabeca = f"{i}. pico {fmt_ts(h['start_time'])} (valor {h['value']:.2f})"
         print(f"  {cabeca}  ->  "
@@ -894,7 +1131,7 @@ def cmd_youtube(args) -> int:
         if args.shorts:
             _gerar_shorts(info, args.out, args)
         if args.legenda:
-            codigo = _legendar_pasta(info, args)
+            codigo = _legendar_pasta(info, args, transcritor)
         print("Concluído.")
         return codigo
 

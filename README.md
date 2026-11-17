@@ -59,7 +59,7 @@ A legenda pede a fonte Liberation Sans. Sem ela, o vídeo sai com a fonte que o 
 
 Não baixa vídeo. Mostra título, canal e os 5 picos do heatmap, já com o corte ajustado para uma pausa.
 
-Se o YouTube não publicar o heatmap, o mesmo comando lê só os 300 comentários do topo, não a seção inteira. Junta horários escritos como `12:41` que caem a menos de 20 segundos uns dos outros e usa os mais citados:
+Se o YouTube não publicar o heatmap, o mesmo comando lê só os 300 comentários do topo, não a seção inteira. Junta horários escritos como `12:41` que caem a menos de 20 segundos uns dos outros e usa os mais citados. Sem horário nenhum, transcreve o áudio (o modelo `medium` na primeira vez) e escolhe janelas de ~30 s com gancho nos 2 primeiros segundos, pico de volume e frase que se entende sozinha:
 
 ```bash
 python3 clipes.py youtube "https://www.youtube.com/watch?v=VIDEO_ID"
