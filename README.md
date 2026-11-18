@@ -175,6 +175,32 @@ Ou especificando o nome da saída:
 python3 clipes.py short video.mp4 resultado_9x16.mp4 --legenda
 ```
 
+## Twitter: webcam em cima, gameplay embaixo
+
+Baixa um vídeo público do Twitter/X e monta um Short 9:16. A webcam do streamer fica na parte de cima (cerca de 46% da tela, como no corte do Alanzoka). A gameplay ocupa o resto, no maior pedaço do quadro que não inclui a webcam, para a cena do jogo continuar inteira.
+
+```bash
+python3 clipestwitter.py "https://x.com/usuario/status/123"
+```
+
+Com a legenda da fala, em cima da webcam:
+
+```bash
+python3 clipestwitter.py "https://x.com/usuario/status/123" --legenda
+```
+
+Se a webcam for detectada no lugar errado, passa a caixa em pixels do vídeo original (`x,y,largura,altura`):
+
+```bash
+python3 clipestwitter.py URL --webcam 1440,700,420,320 --legenda
+```
+
+Qualidade do arquivo (vale igual no `clipes.py`): `--crf` menor fica melhor e maior (padrão 20). `--preset slow` comprime melhor e demora mais (padrão `veryfast`).
+
+```bash
+python3 clipestwitter.py URL --crf 18 --preset slow --legenda
+```
+
 ## Um mp4 que você já tem
 
 ```bash
@@ -197,7 +223,9 @@ python3 clipes.py short video.mp4 --sem-motion --delay 3 --suav 0.2
 |---|---|---|
 | `--top N` | youtube | quantos trechos (padrão 5) |
 | `--dur S` | youtube | duração alvo, em segundos (padrão 30) |
-| `--res P` | youtube | altura máxima do download (padrão 720) |
+| `--res P` | youtube | altura máxima do download (padrão 720; no Twitter o padrão é 1920) |
+| `--crf N` | todos | qualidade do x264, 0–51 (menor = melhor, padrão 20) |
+| `--preset NOME` | todos | velocidade do x264 (padrão `veryfast`; `slow` fica melhor) |
 | `--clips` | youtube | baixa os mp4; sem isso, só lista |
 | `--out DIR` | youtube | pasta de saída (padrão `clips`) |
 | `--shorts` | youtube | gera o 9:16 de cada clipe baixado |

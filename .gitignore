@@ -8,6 +8,7 @@ __pycache__/
 
 # Saídas geradas pelo clipes.py
 clips/
+clips_twitter/
 saida/
 *.ass
 *_9x16.mp4

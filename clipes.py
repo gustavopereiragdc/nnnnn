@@ -68,6 +68,10 @@ _TS_RE = re.compile(r"(?<!\d)(?:(\d{1,2}):)?(\d{1,3}):([0-5]\d)(?!\d)")
 # ───────────────────────── recorte 9:16 ──────────────────────────────────────
 ASPECTO_W, ASPECTO_H = 9, 16
 SAIDA_W, SAIDA_H = 1080, 1920
+CRF = 20
+PRESET = "veryfast"
+PRESETS = ("ultrafast", "superfast", "veryfast", "faster",
+           "fast", "medium", "slow", "slower", "veryslow")
 ANALISE_LARG = 320
 FACE_LARG = 640
 FACE_INTERVALO_S = 0.12
@@ -613,7 +617,7 @@ def _escolher_rosto(rostos, lock, largura):
 def fazer_short(entrada, saida, *, analise_larg=ANALISE_LARG,
                 face_intervalo=FACE_INTERVALO_S, delay_mover=DELAY_MOVER_S,
                 suav=SUAVIZACAO, vel_max_frac=VEL_MAX_FRAC,
-                usar_face=True, usar_motion=True, crf=20, preset="veryfast"):
+                usar_face=True, usar_motion=True, crf=CRF, preset=PRESET):
     """Gera `saida` (9:16) a partir de `entrada`. Devolve o caminho de saída.
 
     1) acha rostos (YuNet) e segue o mesmo rosto, sem trocar a cada quadro;
@@ -821,6 +825,15 @@ def _ass_ts(segundos: float) -> str:
     return f"{h}:{m:02d}:{s:05.2f}"
 
 
+def _tem_audio(video: str) -> bool:
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a",
+         "-show_entries", "stream=codec_type", "-of", "csv=p=0", video],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    return proc.returncode == 0 and "audio" in proc.stdout
+
+
 def _tamanho_video(video: str) -> tuple:
     proc = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -833,11 +846,12 @@ def _tamanho_video(video: str) -> tuple:
     return int(larg), int(alt)
 
 
-def _escrever_ass(caminho: str, palavras: list, larg: int, alt: int) -> None:
+def _escrever_ass(caminho: str, palavras: list, larg: int, alt: int,
+                  margem_v: int | None = None) -> None:
     vertical = alt > larg
     fonte = max(28, int(alt * (0.042 if vertical else 0.055)))
     outline = max(3, fonte // 14)
-    margem = int(alt * (0.20 if vertical else 0.07))
+    margem = margem_v if margem_v is not None else int(alt * (0.20 if vertical else 0.07))
     eventos = []
     for grupo in _agrupar_palavras(palavras):
         for i, (ini, fim, _) in enumerate(grupo):
@@ -881,11 +895,12 @@ def _filtro_ass(caminho: str) -> str:
     return f"ass='{p}'"
 
 
-def _queimar_legenda(video: str, ass: str, saida: str) -> None:
+def _queimar_legenda(video: str, ass: str, saida: str,
+                      crf: int = CRF, preset: str = PRESET) -> None:
     proc = subprocess.run(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
          "-i", video, "-vf", _filtro_ass(ass),
-         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+         "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
          "-c:a", "copy", "-movflags", "+faststart", saida],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
     )
@@ -927,15 +942,20 @@ class Transcritor:
         return self._model
 
     def palavras(self, video: str) -> list:
+        if not _tem_audio(video):
+            raise RuntimeError("o vídeo não tem faixa de áudio")
         model = self._carregar()
-        segments, info = model.transcribe(
-            video,
-            language=self.idioma,
-            word_timestamps=True,
-            vad_filter=True,
-            beam_size=5 if self.device == "cuda" else 1,
-            condition_on_previous_text=False,
-        )
+        try:
+            segments, info = model.transcribe(
+                video,
+                language=self.idioma,
+                word_timestamps=True,
+                vad_filter=True,
+                beam_size=5 if self.device == "cuda" else 1,
+                condition_on_previous_text=False,
+            )
+        except IndexError as e:
+            raise RuntimeError("não consegui ler o áudio desse vídeo") from e
         saida = []
         for seg in segments:
             if seg.words:
@@ -949,7 +969,7 @@ class Transcritor:
         print(f"  {os.path.basename(video)}: {len(saida)} palavras ({idioma})")
         return saida
 
-    def legendar(self, video: str) -> str | None:
+    def legendar(self, video: str, crf: int = CRF, preset: str = PRESET) -> str | None:
         """Queima a legenda e devolve o mp4 novo. None se não houver fala."""
         palavras = self.palavras(video)
         if not palavras:
@@ -959,7 +979,7 @@ class Transcritor:
         saida = base + "_legenda.mp4"
         larg, alt = _tamanho_video(video)
         _escrever_ass(ass, palavras, larg, alt)
-        _queimar_legenda(video, ass, saida)
+        _queimar_legenda(video, ass, saida, crf=crf, preset=preset)
         return saida
 
 
@@ -983,7 +1003,7 @@ def _legendar_pasta(info: dict, args, transcritor=None) -> int:
     erros = 0
     for f in alvos:
         try:
-            saida = tr.legendar(f)
+            saida = tr.legendar(f, crf=args.crf, preset=args.preset)
         except Exception as e:
             erros += 1
             print("  ERRO", os.path.basename(f), "->", str(e)[:200])
@@ -1010,6 +1030,7 @@ def _gerar_shorts(info: dict, out: str, args) -> int:
                 f, saida, suav=args.suav, delay_mover=args.delay,
                 usar_face=not args.sem_face,
                 usar_motion=not args.sem_motion,
+                crf=args.crf, preset=args.preset,
             )
             print("  OK", os.path.basename(saida))
         except Exception as e:
@@ -1148,6 +1169,7 @@ def cmd_short(args) -> int:
         analise_larg=args.analise_larg, face_intervalo=args.face_intervalo,
         delay_mover=args.delay, suav=args.suav, vel_max_frac=args.vel_max,
         usar_face=not args.sem_face, usar_motion=not args.sem_motion,
+        crf=args.crf, preset=args.preset,
     )
     print("Short salvo:", saida)
     if not args.legenda:
@@ -1155,7 +1177,8 @@ def cmd_short(args) -> int:
     print(f"Legendando (modelo {args.modelo}, idioma {args.idioma})...")
     idioma = None if args.idioma == "auto" else args.idioma
     try:
-        leg = Transcritor(args.modelo, idioma).legendar(saida)
+        leg = Transcritor(args.modelo, idioma).legendar(
+            saida, crf=args.crf, preset=args.preset)
     except Exception as e:
         print("ERRO na legenda:", str(e)[:200])
         return 1
@@ -1177,6 +1200,23 @@ def _add_shorts_flags(ap, *, com_analise: bool):
         ap.add_argument("--analise-larg", type=int, default=ANALISE_LARG)
         ap.add_argument("--face-intervalo", type=float, default=FACE_INTERVALO_S)
         ap.add_argument("--vel-max", type=float, default=VEL_MAX_FRAC)
+
+
+def _crf_arg(valor):
+    try:
+        n = int(valor)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("crf precisa ser um número") from e
+    if not 0 <= n <= 51:
+        raise argparse.ArgumentTypeError("crf vai de 0 a 51")
+    return n
+
+
+def _add_qualidade_flags(ap):
+    ap.add_argument("--crf", type=_crf_arg, default=CRF,
+                    help="qualidade do x264, 0-51 (menor = melhor, padrão 20)")
+    ap.add_argument("--preset", default=PRESET, choices=PRESETS,
+                    help="velocidade do x264 (padrão veryfast; slow fica melhor)")
 
 
 def _add_legenda_flags(ap):
@@ -1214,6 +1254,7 @@ def main() -> int:
     yt.add_argument("--shorts", action="store_true",
                     help="gerar a versão 9:16 de cada clipe baixado")
     _add_shorts_flags(yt, com_analise=False)
+    _add_qualidade_flags(yt)
     _add_legenda_flags(yt)
     yt.set_defaults(func=cmd_youtube)
 
@@ -1221,6 +1262,7 @@ def main() -> int:
     sh.add_argument("entrada")
     sh.add_argument("saida", nargs="?", help="default: <entrada>_9x16.mp4")
     _add_shorts_flags(sh, com_analise=True)
+    _add_qualidade_flags(sh)
     _add_legenda_flags(sh)
     sh.set_defaults(func=cmd_short)
 
